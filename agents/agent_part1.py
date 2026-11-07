@@ -28,7 +28,7 @@ class Agent(object):
         ### complications: pickle works with any machine learning models defined in sklearn, xgboost, etc.
         ### custom classes must also be importable when the saved model is loaded
         ### refer to 'model_training/purchase_model_baseline.ipynb' for a quick tutorial on how to use pickle
-        self.filename = os.path.join(os.path.dirname(__file__), 'helper_files_here', 'purchase_model.pkl')
+        self.filename = os.path.join(os.path.dirname(__file__), 'helper_files_here', 'xgb_model.pkl')
         with open(self.filename, 'rb') as file:
             self.trained_model = pickle.load(file)
         self.price_grid = np.linspace(0, 500, 101)  # Baseline grid.
@@ -85,7 +85,7 @@ class Agent(object):
         features['price_item'] = self.price_grid
         # Clip regression predictions; for a classifier, you may need
         # predict_proba() instead of predict(), using the column for purchase = 1.
-        probability = np.clip(self.trained_model.predict(features), 0, 1)
+        probability = self.trained_model.predict_proba(features)[:, 1]
         # Naive inventory heuristic: spread expected sales over remaining customers.
         target_probability = min(1, self.remaining_inventory / max(1, time_until_replenish))
         eligible = probability <= target_probability
