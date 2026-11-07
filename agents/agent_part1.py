@@ -33,6 +33,9 @@ class Agent(object):
             self.trained_model = pickle.load(file)
         self.price_grid = np.linspace(0, 500, 101)  # Baseline grid.
 
+        self.V = np.load(os.path.join(os.path.dirname(__file__), "helper_files_here","bellman_values_xgb.npy") ##
+)
+
     def _process_last_sale(
             self, 
             last_sale,
@@ -77,39 +80,32 @@ class Agent(object):
         The expected output is a single number, indicating the price that you would post for the new buyer.
         '''
 
-        
-        # Dynamic pricing with inventory opportunity cost
+        # Get current customer and inventory information
+        buyer, last_sale, state, inventories, time_until_replenish = obs
 
-        inventory = inventories[self.this_agent_number]
-        customers_left = max(1, time_until_replenish)
+        s = int(inventories[self.this_agent_number])
+        t = max(1, min(20, int(time_until_replenish)))
 
-        # If there is no inventory, no sale is possible.
-        if inventory <= 0:
-            return 0.0
+        if s <= 0:
+            return 500.0
 
-        # Expected revenue for each possible price
-        expected_revenue = self.price_grid * probability
-
-        # Unconstrained optimal revenue
-        best_revenue = np.max(expected_revenue)
-
-        # Inventory pressure: higher when stock is scarce
-        inventory_pressure = max(
-            0.0, 1.0 - inventory / customers_left
+        # Prepare customer features for every possible price
+        features = pd.DataFrame(
+            np.tile(buyer, (len(self.price_grid), 1)),
+            columns=["Covariate1", "Covariate2", "Covariate3"]
         )
 
-        # Opportunity cost of using one inventory unit
-        opportunity_cost = best_revenue * inventory_pressure
+        features["price_item"] = self.price_grid
 
-        # Adjusted expected revenue
-        adjusted_revenue = (
-            self.price_grid - opportunity_cost
-        ) * probability
+        # Predict purchase probabilities using XGBoost
+        probability = self.trained_model.predict_proba(features)[:, 1]
 
-        # Choose the price maximizing adjusted revenue
-        best_price_index = np.argmax(adjusted_revenue)
+        # Bellman: future value lost when selling one item
+        opportunity_cost = self.V[t-1, s] - self.V[t-1, s-1]
 
-        return float(self.price_grid[best_price_index])
+        # Choose the price maximizing adjusted expected revenue
+        score = probability * (self.price_grid - opportunity_cost)
 
-        score = np.where(eligible, self.price_grid * probability, -np.inf)
         return float(self.price_grid[np.argmax(score)])
+
+       
