@@ -77,19 +77,39 @@ class Agent(object):
         The expected output is a single number, indicating the price that you would post for the new buyer.
         '''
 
-        new_buyer_covariates, last_sale, state, inventories, time_until_replenish = obs
-        self._process_last_sale(last_sale, state, inventories, time_until_replenish)
+        
+        # Dynamic pricing with inventory opportunity cost
 
-        features = pd.DataFrame(np.tile(new_buyer_covariates, (len(self.price_grid), 1)),
-                                columns=['Covariate1', 'Covariate2', 'Covariate3'])
-        features['price_item'] = self.price_grid
-        # Clip regression predictions; for a classifier, you may need
-        # predict_proba() instead of predict(), using the column for purchase = 1.
-        probability = self.trained_model.predict_proba(features)[:, 1]
-        # Naive inventory heuristic: spread expected sales over remaining customers.
-        target_probability = min(1, self.remaining_inventory / max(1, time_until_replenish))
-        eligible = probability <= target_probability
-        if not eligible.any():
-            return float(self.price_grid[-1])
+        inventory = inventories[self.this_agent_number]
+        customers_left = max(1, time_until_replenish)
+
+        # If there is no inventory, no sale is possible.
+        if inventory <= 0:
+            return 0.0
+
+        # Expected revenue for each possible price
+        expected_revenue = self.price_grid * probability
+
+        # Unconstrained optimal revenue
+        best_revenue = np.max(expected_revenue)
+
+        # Inventory pressure: higher when stock is scarce
+        inventory_pressure = max(
+            0.0, 1.0 - inventory / customers_left
+        )
+
+        # Opportunity cost of using one inventory unit
+        opportunity_cost = best_revenue * inventory_pressure
+
+        # Adjusted expected revenue
+        adjusted_revenue = (
+            self.price_grid - opportunity_cost
+        ) * probability
+
+        # Choose the price maximizing adjusted revenue
+        best_price_index = np.argmax(adjusted_revenue)
+
+        return float(self.price_grid[best_price_index])
+
         score = np.where(eligible, self.price_grid * probability, -np.inf)
         return float(self.price_grid[np.argmax(score)])
