@@ -1,103 +1,127 @@
-import random
-import pickle
 import os
+import pickle
 import numpy as np
 import pandas as pd
+from scipy.special import ndtr   # standard normal CDF
 
+"""
+Part 2 agent: capacity-aware pricing against one competitor.
 
-'''
-This template serves as a starting point for your Part 2 agent.
-'''
+Every customer buys from the cheapest seller that has stock (and whose price is <= their value).
+So to sell, my price must be (a) acceptable to the customer AND (b) lower than the rival's price:
+
+    P(I win | p) = q(p | covariates)  *  P(rival price > p)
+
+ q(p | covariates)  : purchase model (gradient boosting, monotone in price) - same as Part 1
+ P(rival price > p) : learned online from the rival's past posted prices (recency-weighted, smoothed)
+                      = 1 if the rival is out of stock (then I am a monopolist for this customer)
+ opportunity cost   : Bellman value of capacity (helper_files_here/bellman_values_xgb.npy):
+                      delta = V[t-1, s] - V[t-1, s-1] = future value of the unit I would give up
+
+Chosen price = argmax_p  P(I win | p) * (p - delta).
+"""
+
+# knobs (tuned on simulated opponents)
+HALF_LIFE = 12.0     # how fast the rival's old prices are forgotten (in customers)
+WINDOW = 60          # max number of rival prices remembered
+MIN_BW = 2.0         # smoothing (std, in $) of the rival price distribution
+REL_BW = 0.05        # ... or this fraction of the rival's typical price, whichever is bigger
+DELTA_SCALE = 1.0    # scales the opportunity cost (1 = trust the single-agent Bellman values)
 
 
 class Agent(object):
     def __init__(self, agent_number, params={}):
-        self.this_agent_number = agent_number  # index for this agent
-        
-        self.project_part = params['project_part'] 
-
-        ### starting remaining inventory and inventory replenish rate are provided
-        ## every time the inventory is replenished, it is set to the inventory limit
-        ## the inventory_replenish rate is how often the inventory is replenished
-        ## inventory is reset to a uniformly random integer from 7 to 20 every 20 customers.
+        self.this_agent_number = agent_number
+        self.opponent_number = 1 - agent_number
+        self.project_part = params['project_part']
         self.remaining_inventory = params['inventory_limit']
         self.inventory_replenish = params['inventory_replenish']
 
-        ### useful if you want to use a more complex price prediction model
-        ### do not rename agent_part2.py or the helper_files_here folder
-        ### complications: pickle works with any machine learning models defined in sklearn, xgboost, etc.
-        ### custom classes must also be importable when the saved model is loaded
-        ### refer to 'model_training/purchase_model_baseline.ipynb' for a quick tutorial on how to use pickle
-        self.filename = os.path.join(os.path.dirname(__file__), 'helper_files_here', 'purchase_model.pkl')
-        with open(self.filename, 'rb') as file:
-            self.trained_model = pickle.load(file)
-        self.price_grid = np.linspace(0, 500, 101)  # Baseline grid, not a pricing restriction.
+        base = os.path.join(os.path.dirname(__file__), 'helper_files_here')
+        with open(os.path.join(base, 'xgb_model.pkl'), 'rb') as f:
+            self.trained_model = pickle.load(f)
+        self.V = np.load(os.path.join(base, 'bellman_values_xgb.npy'))
+        self.price_grid = np.linspace(0, 500, 101)
 
-        ### potentially useful for Part 2 -- When competition is between two agents
-        ### and you want to keep track of the opponent's status
-        self.opponent_number = 1 - agent_number  # index for opponent
+        self.opp_prices = []          # rival prices observed while the rival had stock
+        self.opp_offsets = []         # rival price minus MY price one step earlier (for "follower" rivals)
+        self.my_prev = None           # my price in the round before the last one
+        self.my_last = None           # my price in the last round
+        self.prev_opp_inventory = None
+        self.cols = ['Covariate1', 'Covariate2', 'Covariate3']
 
-    def _process_last_sale(
-            self, 
-            last_sale,
-            state,
-            inventories,
-            time_until_replenish
-        ):
-        '''
-        This function updates your internal state based on the last sale that occurred.
-        This template shows you several ways you can keep track of important metrics.
-        '''
-        ### keep track of who, if anyone, the customer bought from
-        did_customer_buy_from_me = (last_sale[0] == self.this_agent_number)
-        did_customer_buy_from_opponent = (last_sale[0] == self.opponent_number)
+    # ---- learning the rival from what we observe ------------------------------------
+    def _process_last_sale(self, last_sale, inventories):
+        opp_price = last_sale[1][self.opponent_number]
+        my_price = last_sale[1][self.this_agent_number]
+        # the rival posted opp_price after seeing MY price from the round before (self.my_last)
+        # a rival with no stock may post junk (e.g. 0) that cannot win -> ignore those
+        if (not np.isnan(opp_price)) and self.prev_opp_inventory is not None and self.prev_opp_inventory > 0:
+            self.opp_prices.append(float(opp_price))
+            if self.my_last is not None:
+                self.opp_offsets.append(float(opp_price) - self.my_last)
+            else:
+                self.opp_offsets.append(np.nan)
+            if len(self.opp_prices) > WINDOW:
+                self.opp_prices.pop(0)
+                self.opp_offsets.pop(0)
+        if not np.isnan(my_price):
+            self.my_last = float(my_price)
+        self.prev_opp_inventory = int(inventories[self.opponent_number])
 
-        ### keep track of the prices that were offered in the last sale
-        my_last_prices = last_sale[1][self.this_agent_number]
-        opponent_last_prices = last_sale[1][self.opponent_number]
+    def _rival_samples(self):
+        """Candidate values for the rival's next price.
+        Model A ("fixed-type" rival): its own past prices.
+        Model B ("follower" rival, e.g. undercuts me): my latest price + its past offsets from my price.
+        Use whichever model has been predicting better over the last 15 rounds."""
+        x = np.asarray(self.opp_prices)
+        off = np.asarray(self.opp_offsets)
+        k = 15
+        ok = ~np.isnan(off)
+        if self.my_last is None or ok.sum() < 6:
+            return x
+        xa, xo = x[-k:], off[-k:]
+        okk = ~np.isnan(xo)
+        # leave-one-out style error: deviation from the mean of the other recent values
+        err_a = np.std(xa[okk])
+        err_b = np.std(xo[okk])
+        if err_b < 0.7 * err_a:
+            return np.clip(self.my_last + off[ok], 0, None)
+        return x
 
-        ### keep track of the profit for this agent after the last sale
-        my_current_profit = state[self.this_agent_number]
-        opponent_current_profit = state[self.opponent_number]
+    def _prob_rival_above(self):
+        """P(rival price > p) on the price grid, from recency-weighted, Gaussian-smoothed past prices."""
+        x = self._rival_samples()
+        n = len(x)
+        w = 0.5 ** ((n - 1 - np.arange(n)) / HALF_LIFE)
+        w /= w.sum()
+        bw = max(MIN_BW, REL_BW * float(np.dot(w, x)))
+        z = (self.price_grid[:, None] - x[None, :]) / bw
+        # P(rival > p) = sum_i w_i * (1 - Phi(z_i)),  Phi via erf
+        cdf = ndtr(z)
+        return (w[None, :] * (1.0 - cdf)).sum(axis=1)
 
-        ### keep track of the inventory levels after the last sale
-        self.remaining_inventory = inventories[self.this_agent_number]
-        opponent_inventory = inventories[self.opponent_number]
-
-        ### keep track of the time until the next replenishment
-        time_until_replenish = time_until_replenish
-
-        ### TODO - add your code here to potentially update your pricing strategy 
-        ### based on what happened in the last round
-        pass
-
+    # ---- the decision ----------------------------------------------------------------
     def action(self, obs):
-        '''
-        This function is called every time the agent needs to choose an action by the environment.
+        buyer, last_sale, state, inventories, time_until_replenish = obs
+        self._process_last_sale(last_sale, inventories)
 
-        The input 'obs' is a 5 tuple, containing the following information:
-        -- new_buyer_covariates: a vector of length 3, containing the covariates of the new buyer.
-        -- last_sale: a tuple of length 2. The first element is the index of the agent that made the last sale, if it is NaN, then the customer did not make a purchase. The second element is a numpy array of length n_agents, containing the prices that were offered by each agent in the last sale.
-        -- state: a vector of length n_agents, containing the current profit of each agent.
-        -- inventories: a vector of length n_agents, containing the current inventory level of each agent.
-        -- time_until_replenish: an integer indicating the time until the next replenishment, by which time your (and your opponent's, in part 2) remaining inventory will be reset to the inventory limit.
+        s = int(inventories[self.this_agent_number])
+        t = max(1, min(20, int(time_until_replenish)))
+        if s <= 0:
+            return 500.0   # cannot sell anyway
 
-        The expected output is a single number, indicating the price that you would post for the new buyer.
-        '''
+        feats = pd.DataFrame(np.tile(buyer, (len(self.price_grid), 1)), columns=self.cols)
+        feats['price_item'] = self.price_grid
+        q = self.trained_model.predict_proba(feats)[:, 1]
 
-        new_buyer_covariates, last_sale, state, inventories, time_until_replenish = obs
-        self._process_last_sale(last_sale, state, inventories, time_until_replenish)
+        if int(inventories[self.opponent_number]) <= 0:
+            p_beat = np.ones(len(self.price_grid))        # rival has nothing to sell
+        elif len(self.opp_prices) == 0:
+            p_beat = np.ones(len(self.price_grid))        # no information yet
+        else:
+            p_beat = self._prob_rival_above()
 
-        features = pd.DataFrame(np.tile(new_buyer_covariates, (len(self.price_grid), 1)),
-                                columns=['Covariate1', 'Covariate2', 'Covariate3'])
-        features['price_item'] = self.price_grid
-        # Clip regression predictions; for a classifier, you may need
-        # predict_proba() instead of predict(), using the column for purchase = 1.
-        probability = np.clip(self.trained_model.predict(features), 0, 1)
-        # Naive inventory heuristic: spread expected sales over remaining customers.
-        target_probability = min(1, self.remaining_inventory / max(1, time_until_replenish))
-        eligible = probability <= target_probability
-        if not eligible.any():
-            return float(self.price_grid[-1])
-        score = np.where(eligible, self.price_grid * probability, -np.inf)
-        return float(self.price_grid[np.argmax(score)])
+        delta = DELTA_SCALE * (self.V[t - 1, s] - self.V[t - 1, s - 1])
+        score = q * p_beat * (self.price_grid - delta)
+        return float(self.price_grid[int(np.argmax(score))])
